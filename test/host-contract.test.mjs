@@ -74,6 +74,7 @@ test('apply wraps start / create, registers guard and events, and restores on di
   apply(ctx)
   assert.equal(guards.length, 1)
   assert.ok(events['tools/pre-execute'])
+  assert.ok(events['tools/execute'])
   assert.ok(events['subagent/end'])
   assert.notEqual(ctx.subagents.start, origStart)
   assert.notEqual(ctx.agents.create, origCreate)
@@ -166,6 +167,135 @@ test('pre-execute denies a grandchild subagent and a partial file read for resea
   const file = pre({ agent: child, name: 'read', arguments: { path: 'README' } }, () => ({ kind: 'allow' }))
   assert.equal(file.kind, 'deny')
   assert.match(file.reason, /partial/)
+})
+
+test('research role child inherits read-only policy and no worktree', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-delegate-host-'))
+  _internal.setDshHome(home)
+  const { ctx, creates } = mockCtx()
+  apply(ctx)
+  const parent = parentAgent(0, 'session-parent-role01')
+  saveChildSync(home, {
+    sessionId: parent.session.id,
+    policy: applyPreset('developer'),
+    roles: ['research', 'reviewer'],
+  })
+  const { runWithBag } = await import('../delegate-context.mjs')
+  const childId = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff'
+  await runWithBag({ role: 'research', label: 'survey', taskKey: 'survey#research' }, () => ctx.agents.create({
+    sessionId: childId,
+    meta: { origin: 'subagent', parentSession: parent.session.id, cwd: process.cwd(), delegationDepth: 1 },
+  }))
+  assert.equal(creates[0].meta.cwd, process.cwd())
+  const record = loadChildSync(home, childId)
+  assert.equal(record.role, 'research')
+  assert.equal(record.policy.files.write, 'none')
+  assert.deepEqual(record.roles, [])
+})
+
+test('pre-execute denies an unauthorized role and a budget overflow', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-delegate-host-'))
+  _internal.setDshHome(home)
+  const { ctx, events } = mockCtx()
+  apply(ctx)
+  const parent = parentAgent(0, 'session-parent-role02')
+  saveChildSync(home, {
+    sessionId: parent.session.id,
+    policy: { ...applyPreset('developer'), delegation: { maxDepth: 1, maxChildren: 1 } },
+    roles: ['research'],
+  })
+  saveChildSync(home, {
+    sessionId: 'session-live-child01',
+    parentSession: parent.session.id,
+    policy: applyPreset('research'),
+  })
+  const pre = events['tools/pre-execute']
+  const role = pre({ agent: parent, name: 'subagent', arguments: { role: 'release' } }, () => ({ kind: 'allow' }))
+  assert.equal(role.kind, 'deny')
+  assert.match(role.reason, /allowlist/)
+  const budget = pre({ agent: parent, name: 'subagent', arguments: { role: 'research' } }, () => ({ kind: 'allow' }))
+  assert.equal(budget.kind, 'deny')
+  assert.match(budget.reason, /budget exceeded/)
+})
+
+test('reportFrom rejects a stale generation after a newer same-task start', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-delegate-host-'))
+  _internal.setDshHome(home)
+  const reports = []
+  const { ctx } = mockCtx({
+    subagents: {
+      async start() { return { id: 'run' } },
+      async startContinuable() { return { childId: 'x' } },
+      async reportFrom(child, content) {
+        reports.push({ child, content })
+        return 'msg-1'
+      },
+    },
+  })
+  apply(ctx)
+  const { runWithBag } = await import('../delegate-context.mjs')
+  const parent = parentAgent(0, 'session-parent-stale1')
+  saveChildSync(home, { sessionId: parent.session.id, policy: applyPreset('developer'), roles: ['research'] })
+  await runWithBag({ role: 'research', label: 'survey', taskKey: 'survey#research' }, () => ctx.agents.create({
+    sessionId: 'cccccccc-dddd-eeee-ffff-000000000001',
+    meta: { origin: 'subagent', parentSession: parent.session.id, cwd: process.cwd(), delegationDepth: 1 },
+  }))
+  await runWithBag({ role: 'research', label: 'survey', taskKey: 'survey#research' }, () => ctx.agents.create({
+    sessionId: 'cccccccc-dddd-eeee-ffff-000000000002',
+    meta: { origin: 'subagent', parentSession: parent.session.id, cwd: process.cwd(), delegationDepth: 1 },
+  }))
+  const oldChild = {
+    session: { id: 'cccccccc-dddd-eeee-ffff-000000000001', header: {} },
+  }
+  await assert.rejects(
+    () => ctx.subagents.reportFrom(oldChild, [{ type: 'text', text: 'old' }], {}),
+    /stale subagent result/,
+  )
+  assert.equal(reports.length, 0)
+})
+
+test('background bash resolve is pinned to a job worktree', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'dsh-delegate-repo-'))
+  execFileSync('git', ['init'], { cwd: repo })
+  execFileSync('git', ['config', 'user.email', 't@t.test'], { cwd: repo })
+  execFileSync('git', ['config', 'user.name', 't'], { cwd: repo })
+  await writeFile(join(repo, 'README'), 'root\n')
+  execFileSync('git', ['add', '.'], { cwd: repo })
+  execFileSync('git', ['commit', '-m', 'init'], { cwd: repo })
+
+  const home = await mkdtemp(join(tmpdir(), 'dsh-delegate-host-'))
+  _internal.setDshHome(home)
+  const resolved = []
+  const { ctx, events } = mockCtx({
+    shell: {
+      resolve(request) {
+        resolved.push(request)
+        return request
+      },
+    },
+  })
+  apply(ctx)
+  const parent = {
+    options: {},
+    session: {
+      id: 'session-parent-job001',
+      header: { cwd: repo, delegationDepth: 0, agentPreset: 'developer' },
+      events: [],
+    },
+  }
+  saveChildSync(home, { sessionId: parent.session.id, policy: applyPreset('developer') })
+  const exec = {
+    agent: parent,
+    name: 'bash',
+    arguments: { command: 'echo hi', description: 'bg', run_in_background: true },
+  }
+  await events['tools/execute'](exec, () => {
+    const next = ctx.shell.resolve({ command: 'echo hi' })
+    return { kind: 'background', jobId: 'bash-1' }
+  })
+  assert.equal(resolved.length, 1)
+  assert.notEqual(resolved[0].workdir, repo)
+  assert.match(resolved[0].workdir, /agent-delegate\/worktrees\/job-/)
 })
 
 test('main session create is not given a worktree', async () => {
