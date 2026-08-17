@@ -65,6 +65,67 @@ function wrapMethod(obj, key, wrapper) {
   }
 }
 
+function optionalService(ctx, key) {
+  if (ctx && typeof ctx.get === 'function') {
+    try {
+      const got = ctx.get(key)
+      if (got != null) return got
+    } catch { /* not injected */ }
+  }
+  if (ctx && Object.prototype.hasOwnProperty.call(ctx, key)) return ctx[key]
+  return undefined
+}
+
+function wrapShell(ctx) {
+  return wrapMethod(optionalService(ctx, 'shell'), 'resolve', function (orig, request) {
+    const bag = currentBag()
+    if (bag && bag.jobWorktree) {
+      return orig.call(this, { ...request, workdir: bag.jobWorktree })
+    }
+    return orig.call(this, request)
+  })
+}
+
+function wrapJobs(ctx) {
+  const jobs = optionalService(ctx, 'jobs')
+  const stopJobs = wrapMethod(jobs, 'start', function (orig, spec) {
+    if (!spec || (spec.kind !== 'bash' && spec.kind !== 'subagent')) return orig.call(this, spec)
+    const bag = currentBag()
+    const reserved = bag && bag.jobId
+    const owner = spec.owner
+    const policy = policyOf(owner)
+    const budget = budgetOf(policy, recordOf(owner))
+    if (!reserved) {
+      const reason = budgetDenyReason(liveCount(parentIdOf(owner)), budget.maxChildren)
+      if (reason) {
+        const err = new Error(reason)
+        err.name = 'SubagentBudgetError'
+        throw err
+      }
+    }
+    const limit = spec.outputLimitBytes == null
+      ? budget.maxOutputBytes
+      : Math.min(spec.outputLimitBytes, budget.maxOutputBytes)
+    const id = orig.call(this, { ...spec, outputLimitBytes: limit })
+    if (reserved) {
+      const record = loadChildSync(dshHome, reserved)
+      if (record) saveChildSync(dshHome, { ...record, jobId: id })
+    }
+    return id
+  })
+  const stopJobDone = jobs && typeof jobs.onJobDone === 'function'
+    ? jobs.onJobDone((snapshot) => {
+      if (!snapshot || !snapshot.id || snapshot.status === 'running' || snapshot.status === 'stopping') return
+      const rows = listLiveChildren(dshHome).filter((row) => row.kind === 'job' && row.jobId === snapshot.id)
+      for (const row of rows) cleanupChild(row.sessionId)
+    })
+    : function () {}
+  return function () {
+    stopJobs()
+    stopJobDone()
+  }
+}
+
 function headerOf(agentOrSession) {
   if (!agentOrSession) return {}
   if (agentOrSession.header) return agentOrSession.header
@@ -353,6 +414,20 @@ export function apply(ctx) {
   const stopCreate = wrapMethod(ctx.agents, 'create', function (orig, options) {
     return Promise.resolve().then(() => orig.call(this, prepareChildCreate(ctx, options)))
   })
+  const optionalStops = []
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['shell'], (sub) => {
+      const stop = wrapShell(sub)
+      sub.effect(() => () => stop())
+    })
+    ctx.inject(['jobs'], (sub) => {
+      const stop = wrapJobs(sub)
+      sub.effect(() => () => stop())
+    })
+  } else {
+    optionalStops.push(wrapShell(ctx), wrapJobs(ctx))
+  }
+
   const stopReport = wrapMethod(ctx.subagents, 'reportFrom', function (orig, child, content, options) {
     return Promise.resolve().then(() => {
       const session = child && child.session
@@ -370,46 +445,6 @@ export function apply(ctx) {
       return orig.call(this, child, content, options)
     })
   })
-  const stopResolve = wrapMethod(ctx.shell, 'resolve', function (orig, request) {
-    const bag = currentBag()
-    if (bag && bag.jobWorktree) {
-      return orig.call(this, { ...request, workdir: bag.jobWorktree })
-    }
-    return orig.call(this, request)
-  })
-  const stopJobs = wrapMethod(ctx.jobs, 'start', function (orig, spec) {
-    if (!spec || (spec.kind !== 'bash' && spec.kind !== 'subagent')) return orig.call(this, spec)
-    const bag = currentBag()
-    const reserved = bag && bag.jobId
-    const owner = spec.owner
-    const policy = policyOf(owner)
-    const budget = budgetOf(policy, recordOf(owner))
-    if (!reserved) {
-      const reason = budgetDenyReason(liveCount(parentIdOf(owner)), budget.maxChildren)
-      if (reason) {
-        const err = new Error(reason)
-        err.name = 'SubagentBudgetError'
-        throw err
-      }
-    }
-    const limit = spec.outputLimitBytes == null
-      ? budget.maxOutputBytes
-      : Math.min(spec.outputLimitBytes, budget.maxOutputBytes)
-    const id = orig.call(this, { ...spec, outputLimitBytes: limit })
-    if (reserved) {
-      const record = loadChildSync(dshHome, reserved)
-      if (record) saveChildSync(dshHome, { ...record, jobId: id })
-    }
-    return id
-  })
-  const stopJobDone = ctx.jobs && typeof ctx.jobs.onJobDone === 'function'
-    ? ctx.jobs.onJobDone((snapshot) => {
-      if (!snapshot || !snapshot.id || snapshot.status === 'running' || snapshot.status === 'stopping') return
-      const rows = listLiveChildren(dshHome).filter((row) => row.kind === 'job' && row.jobId === snapshot.id)
-      for (const row of rows) cleanupChild(row.sessionId)
-    })
-    : function () {}
-
   const stopGuard = ctx.tools && typeof ctx.tools.guard === 'function'
     ? ctx.tools.guard((exec) => denyExec(ctx, exec))
     : function () {}
@@ -464,9 +499,7 @@ export function apply(ctx) {
     if (typeof stopContinuable === 'function') stopContinuable()
     if (typeof stopCreate === 'function') stopCreate()
     if (typeof stopReport === 'function') stopReport()
-    if (typeof stopResolve === 'function') stopResolve()
-    if (typeof stopJobs === 'function') stopJobs()
-    if (typeof stopJobDone === 'function') stopJobDone()
+    for (const stop of optionalStops) if (typeof stop === 'function') stop()
     if (typeof stopGuard === 'function') stopGuard()
     if (typeof stopPre === 'function') stopPre()
     if (typeof stopExecute === 'function') stopExecute()
