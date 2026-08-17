@@ -1,0 +1,31 @@
+{
+  "name": "dsh-agent-delegate",
+  "version": "0.1.0",
+  "description": "Delegation broker for DeepSeek Harness. 真实委派深度、child 能力衰减、写入型 child 的 Git worktree，以及 sandbox partial 拒绝。",
+  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "subagent", "delegate"],
+  "license": "MIT",
+  "type": "module",
+  "main": "./host.js",
+  "exports": {
+    ".": "./host.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host.js",
+    "delegate-depth.mjs",
+    "delegate-policy.mjs",
+    "delegate-store.mjs",
+    "delegate-worktree.mjs",
+    "delegate-sandbox.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  }
+}
