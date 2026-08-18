@@ -7,6 +7,7 @@ import test from 'node:test'
 import { applyPreset } from '../../dsh-session-permissions/perm-schema.mjs'
 import { apply, inject, name, _internal } from '../host.js'
 import { loadChildSync, saveChildSync } from '../delegate-store.mjs'
+import { applyHandoffToParent, loadHandoff } from '../delegate-deliver.mjs'
 
 test('named exports and inject', () => {
   assert.equal(name, 'dsh-agent-delegate')
@@ -198,6 +199,12 @@ test('subagent end keeps a child patch and deletes the worktree', async () => {
   await assert.rejects(() => readFile(join(record.worktree, 'shipped.txt'), 'utf8'))
   await assert.rejects(() => readFile(join(repo, 'shipped.txt'), 'utf8'))
   assert.equal(loadChildSync(home, childId), null)
+  const pending = loadHandoff(home, childId)
+  assert.equal(pending.status, 'pending')
+  const applied = applyHandoffToParent(home, childId)
+  assert.equal(applied.ok, true)
+  assert.equal(applied.status, 'applied')
+  assert.equal(await readFile(join(repo, 'shipped.txt'), 'utf8'), 'from-child\n')
 })
 
 test('pre-execute denies a grandchild subagent and a partial file read for research', async () => {

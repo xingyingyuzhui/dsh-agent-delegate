@@ -132,22 +132,22 @@ export function collectWorktreePatch({ home, sessionId, worktree, baseCommit, ru
   }
 }
 
-export function formatHandoffNote(info) {
+export function formatHandoffNote(info, childSessionId) {
   if (!info || info.empty) return ''
   const files = Array.isArray(info.files) ? info.files : []
   const shown = files.slice(0, 20)
   const extra = files.length > shown.length ? '\n- … +' + (files.length - shown.length) + ' more' : ''
-  const apply = info.parentRoot
-    ? 'git -C ' + info.parentRoot + ' apply ' + info.path
-    : 'git apply ' + info.path
+  const id = childSessionId || info.childSessionId || ''
   return [
-    'Child wrote files in an isolated worktree. They are not in the parent workspace until you apply them.',
-    '',
-    apply,
+    'Child wrote files in an isolated worktree. They are not in the parent workspace until you accept the handoff.',
+    id ? 'Pending handoff: ' + id : '',
+    id ? 'After you review the child result, call delegate_handoff with action=accept and child=' + id + '.' : '',
+    id ? 'To discard: action=reject. Do not git apply unless you are handling a conflict yourself.' : '',
+    info.path ? 'Patch: ' + info.path : '',
     '',
     'Files (' + files.length + ', ' + info.bytes + ' bytes):',
     ...shown.map((name) => '- ' + name),
-  ].join('\n') + extra
+  ].filter((line, index, all) => line !== '' || (index > 0 && all[index - 1] !== '')).join('\n') + extra
 }
 
 export function deliverChildHandoff({ home, sessionId, worktree, baseCommit, parentRoot, runner }) {

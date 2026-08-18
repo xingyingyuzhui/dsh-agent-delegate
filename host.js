@@ -40,6 +40,7 @@ import {
   saveChildSync,
 } from './delegate-store.mjs'
 import { createWriteWorktree, deliverChildHandoff, formatHandoffNote, removeWriteWorktree } from './delegate-worktree.mjs'
+import { applyHandoffToParent, listHandoffs, loadHandoff, persistChildHandoff, rejectHandoff } from './delegate-deliver.mjs'
 import { CODES, operation, runWithTrace, setObserveHome } from '../dsh-observability/observe.mjs'
 
 export const name = 'dsh-agent-delegate'
@@ -414,6 +415,7 @@ function captureHandoff(record) {
     })
     if (info && info.path) {
       saveChildSync(dshHome, { ...record, handoffPath: info.path })
+      persistChildHandoff(dshHome, { ...record, handoffPath: info.path }, info)
     }
     return info
   } catch {
@@ -421,8 +423,8 @@ function captureHandoff(record) {
   }
 }
 
-function attachHandoffNote(result, info) {
-  const note = formatHandoffNote(info)
+function attachHandoffNote(result, info, childSessionId) {
+  const note = formatHandoffNote(info, childSessionId)
   if (!note) return result
   if (!result || typeof result !== 'object') return result
   if (result.kind === 'block' || result.kind === 'deny') return result
@@ -539,7 +541,79 @@ function applyHandoffResult(result, childId, maxBytes) {
   } else if (typeof result.content === 'string') {
     next = { ...result, content: trimHandoff(result.content, maxBytes).text }
   }
-  return attachHandoffNote(next, handoff)
+  return attachHandoffNote(next, handoff, childId)
+}
+
+function runHandoffAction(args, parentSession) {
+  const value = asArgs(args)
+  const action = String(value.action || '').toLowerCase()
+  const child = String(value.child || value.id || '').trim()
+  if (action === 'list' || action === '') {
+    return { ok: true, items: listHandoffs(dshHome, parentSession) }
+  }
+  if (!child) return { ok: false, error: 'child session id required' }
+  const row = loadHandoff(dshHome, child)
+  if (!row) return { ok: false, error: 'handoff not found' }
+  if (row.parentSession && parentSession && row.parentSession !== parentSession) {
+    return { ok: false, error: 'handoff belongs to another parent' }
+  }
+  const op = operation({
+    plugin: 'dsh-agent-delegate',
+    feature: 'handoff',
+    operation: 'parent_' + action,
+    sessionId: parentSession,
+    childSessionId: child,
+  })
+  op.start()
+  if (action === 'accept') {
+    const result = applyHandoffToParent(dshHome, child)
+    if (result.status === 'conflicted') {
+      op.degraded(CODES.DELEGATE_HANDOFF_CONFLICT, { skipReason: 'conflict' })
+    } else if (result.ok) {
+      op.success({ code: CODES.DELEGATE_HANDOFF_APPLIED, status: result.status })
+    } else {
+      op.reject(CODES.DELEGATE_HANDOFF_INVALID, { reason: result.error })
+    }
+    appendAudit(dshHome, { kind: 'handoff-' + result.status, sessionId: child, parentSession, error: result.error || '' })
+    return result
+  }
+  if (action === 'reject') {
+    const result = rejectHandoff(dshHome, child)
+    if (result.ok) op.success({ code: CODES.DELEGATE_HANDOFF_REJECTED })
+    else op.reject(CODES.DELEGATE_HANDOFF_INVALID, { reason: result.error })
+    appendAudit(dshHome, { kind: 'handoff-rejected', sessionId: child, parentSession })
+    return result
+  }
+  op.reject(CODES.DELEGATE_HANDOFF_INVALID, { reason: 'bad action' })
+  return { ok: false, error: 'action must be list, accept, or reject' }
+}
+
+function handoffTool() {
+  return {
+    name: 'delegate_handoff',
+    description: 'Accept, reject, or list write-child handoff patches. Accept applies the saved patch to the parent git workspace after you have reviewed the child. Reject discards it. Do not accept blindly.',
+    timeoutMs: 20000,
+    parameters: {
+      action: { type: 'string', required: true, description: 'list | accept | reject' },
+      child: { type: 'string', description: 'Child session id for accept/reject' },
+    },
+    output: {
+      schema: { type: 'object' },
+      render(_args, value) {
+        return [{ type: 'text', text: JSON.stringify(value || {}, null, 2) }]
+      },
+    },
+    async execute(args, exec) {
+      const parentSession = parentIdOf(exec && exec.agent)
+      return { kind: 'accept', value: runHandoffAction(args || {}, parentSession) }
+    },
+  }
+}
+
+function mountHandoffTool(agent) {
+  const tools = agent && agent.ctx && agent.ctx.tools
+  if (!tools || typeof tools.register !== 'function') return
+  try { tools.register(handoffTool()) } catch { /* already registered */ }
 }
 
 function liveIdsOf(ctx) {
@@ -709,7 +783,7 @@ export function apply(ctx) {
       return runWithBag(bag, () => Promise.resolve().then(() => next()).then((result) => {
         if (bag.jobId) {
           const jobRecord = loadChildSync(dshHome, bag.jobId)
-          return attachHandoffNote(result, captureHandoff(jobRecord))
+          return attachHandoffNote(result, captureHandoff(jobRecord), bag.jobId)
         }
         if (!isSubagentTool(exec && exec.name)) return result
         const policy = policyOf(exec.agent)
@@ -730,6 +804,50 @@ export function apply(ctx) {
     })
     : function () {}
 
+  const stopSessionStart = typeof ctx.on === 'function'
+    ? ctx.on('agent/session-start', (payload) => {
+      mountHandoffTool(payload && payload.agent)
+    })
+    : function () {}
+
+  if (ctx.tools && typeof ctx.tools.register === 'function') {
+    try { ctx.tools.register(handoffTool()) } catch { /* already registered */ }
+  }
+
+  const optionalWeb = optionalService(ctx, 'webServer')
+  const stopRoutes = []
+  if (optionalWeb && typeof optionalWeb.register === 'function') {
+    const writeJson = (res, status, body) => {
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+      res.end(JSON.stringify(body))
+    }
+    stopRoutes.push(optionalWeb.register({
+      kind: 'exact',
+      path: '/dsh-agent-delegate/handoff',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          writeJson(res, 405, { ok: false, error: 'method not allowed' })
+          return
+        }
+        const headers = req.headers || {}
+        if (headers['x-dsh-agent-delegate'] !== '1') {
+          writeJson(res, 403, { ok: false, error: 'missing csrf header' })
+          return
+        }
+        const chunks = []
+        for await (const chunk of req) chunks.push(chunk)
+        let body = {}
+        try {
+          body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}
+        } catch {
+          writeJson(res, 400, { ok: false, error: 'invalid json body' })
+          return
+        }
+        writeJson(res, 200, runHandoffAction(body, body && body.parentSession))
+      },
+    }))
+  }
+
   ctx.effect(() => () => {
     if (typeof stopStart === 'function') stopStart()
     if (typeof stopContinuable === 'function') stopContinuable()
@@ -740,5 +858,7 @@ export function apply(ctx) {
     if (typeof stopPre === 'function') stopPre()
     if (typeof stopExecute === 'function') stopExecute()
     if (typeof stopEnd === 'function') stopEnd()
+    if (typeof stopSessionStart === 'function') stopSessionStart()
+    for (const stop of stopRoutes) if (typeof stop === 'function') stop()
   })
 }
