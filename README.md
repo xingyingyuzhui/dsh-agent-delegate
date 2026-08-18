@@ -15,10 +15,16 @@
 ## 安装
 
 ```sh
-dsh plugin --profile web add link:/abs/path/to/dsh-agent-delegate
+dsh plugin --profile web add github:xingyingyuzhui/dsh-agent-delegate
 ```
 
 建议同时安装 `dsh-session-permissions` 与 `dsh-agent-gate`。装完重启 `dsh web`。
+
+本地开发：
+
+```sh
+dsh plugin --profile web add link:/abs/path/to/dsh-agent-delegate
+```
 
 ## 卸载
 

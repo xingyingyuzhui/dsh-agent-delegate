@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { resolveLayersSync } from '../dsh-session-permissions/perm-layers.mjs'
+import { renderDenyReceipt } from '../dsh-session-permissions/perm-official.mjs'
 import { asArgs, classifyTool } from '../dsh-session-permissions/perm-schema.mjs'
 import { allowExecution } from '../dsh-session-permissions/perm-path.mjs'
 import { currentBag, runWithBag } from './delegate-context.mjs'
@@ -315,7 +316,7 @@ function denyExec(ctx, exec) {
   if (partial) return partial
   const record = loadChildSync(dshHome, session.id)
   if (record && record.policy && !allowExecution(policy, name, args, cwd)) {
-    return 'Denied by delegated child policy (' + classifyTool(name, args) + ').'
+    return renderDenyReceipt(classifyTool(name, args), 'Denied by delegated child policy.')
   }
   return undefined
 }

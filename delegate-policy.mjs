@@ -3,7 +3,7 @@ import {
   intersectPolicies,
   isToolEnabled,
   normalizePolicy,
-} from '../dsh-session-permissions/perm-schema.mjs'
+} from '../dsh-agent-policy/policy-schema.mjs'
 
 const FULL_ISOLATION_PRESETS = ['research', 'reviewer', 'public']
 
