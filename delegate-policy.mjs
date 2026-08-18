@@ -26,7 +26,8 @@ export function childNeedsWorktree(policy) {
   return isToolEnabled(policy, 'write') || isToolEnabled(policy, 'edit') || isToolEnabled(policy, 'apply_patch')
 }
 
-export function requiresFullEnforcement(policy) {
+export function requiresFullEnforcement(policy, role) {
+  if (role && FULL_ISOLATION_PRESETS.includes(role)) return true
   if (!policy) return false
   const sandbox = policy.sandbox
   if (sandbox && sandbox.requireEnforcement === 'full') return true
@@ -38,8 +39,8 @@ export function isFileAction(name, args) {
   return cls === 'read' || cls === 'write' || cls === 'edit' || cls === 'apply_patch' || cls === 'bash'
 }
 
-export function denyPartialFileAction(policy, probe, name, args) {
-  if (!requiresFullEnforcement(policy)) return undefined
+export function denyPartialFileAction(policy, probe, name, args, role) {
+  if (!requiresFullEnforcement(policy, role)) return undefined
   if (!isFileAction(name, args)) return undefined
   if (!probe || probe.kind !== 'ok') return undefined
   if (probe.enforcement !== 'partial') return undefined

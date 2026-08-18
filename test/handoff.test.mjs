@@ -4,6 +4,7 @@ import { isStaleRecord, nextGeneration, taskKeyOf, trimHandoff } from '../delega
 
 test('task keys and generations', () => {
   assert.equal(taskKeyOf('Review PR', 'research'), 'review pr#research')
+  assert.equal(taskKeyOf('  ', null, 'session-abc'), 'session-abc')
   assert.equal(taskKeyOf('  '), 'task')
   assert.equal(nextGeneration(undefined), 1)
   assert.equal(nextGeneration(2), 3)
@@ -21,6 +22,6 @@ test('handoff is byte-capped', () => {
   const cut = trimHandoff(long, 16)
   assert.equal(cut.truncated, true)
   assert.ok(cut.text.endsWith('[truncated]'))
-  assert.ok(Buffer.byteLength(cut.text, 'utf8') > 16)
+  assert.ok(Buffer.byteLength(cut.text, 'utf8') <= 16)
   assert.deepEqual(trimHandoff('ok', 16), { text: 'ok', truncated: false })
 })

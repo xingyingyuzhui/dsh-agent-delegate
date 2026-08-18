@@ -6,6 +6,7 @@ import {
   allowedRolesOf,
   childRolesOf,
   parseRequestedRole,
+  parseRoleRequest,
   roleDenyReason,
   rolePolicyOf,
 } from '../delegate-role.mjs'
@@ -25,6 +26,8 @@ test('role is parsed from args, [role] label, or prompt prefix', () => {
   assert.equal(parseRequestedRole({ description: '[reviewer] check diff' }), 'reviewer')
   assert.equal(parseRequestedRole({ prompt: 'role: public\nlook around' }), 'public')
   assert.equal(parseRequestedRole({ description: 'implement feature' }), null)
+  assert.deepEqual(parseRoleRequest({ role: 'administrator' }), { supplied: true, role: null, raw: 'administrator' })
+  assert.match(roleDenyReason(applyPreset('developer'), null, null, true), /unknown/)
 })
 
 test('named research child is parent ∩ research and does not write', () => {

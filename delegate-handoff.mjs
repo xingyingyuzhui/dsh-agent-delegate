@@ -1,6 +1,6 @@
-export function taskKeyOf(label, role) {
+export function taskKeyOf(label, role, fallback) {
   const raw = String(label || '').trim().toLowerCase().replace(/\s+/g, ' ')
-  const key = raw || 'task'
+  const key = raw || String(fallback || '').trim() || 'task'
   return role ? key + '#' + role : key
 }
 
@@ -20,14 +20,30 @@ export function staleDenyReason() {
   return 'Denied: stale subagent result discarded.'
 }
 
+function cutUtf8(buf, keep) {
+  let cut = buf.subarray(0, Math.max(0, keep))
+  while (cut.length && (cut[cut.length - 1] & 0xc0) === 0x80) {
+    cut = cut.subarray(0, cut.length - 1)
+  }
+  if (cut.length && (cut[cut.length - 1] & 0xc0) === 0xc0) {
+    cut = cut.subarray(0, cut.length - 1)
+  }
+  return cut
+}
+
 export function trimHandoff(text, maxBytes) {
   const limit = Number(maxBytes)
   const value = text == null ? '' : String(text)
   if (!Number.isFinite(limit) || limit <= 0) return { text: value, truncated: false }
   const buf = Buffer.from(value, 'utf8')
   if (buf.length <= limit) return { text: value, truncated: false }
-  const cut = buf.subarray(0, limit).toString('utf8')
-  return { text: cut + '\n[truncated]', truncated: true }
+  const suffix = '\n[truncated]'
+  const suffixBytes = Buffer.byteLength(suffix, 'utf8')
+  if (limit <= suffixBytes) {
+    return { text: cutUtf8(Buffer.from('[truncated]', 'utf8'), limit).toString('utf8'), truncated: true }
+  }
+  const cut = cutUtf8(buf, limit - suffixBytes)
+  return { text: cut.toString('utf8') + suffix, truncated: true }
 }
 
 export function trimContentBlocks(blocks, maxBytes) {
@@ -36,7 +52,13 @@ export function trimContentBlocks(blocks, maxBytes) {
   const out = []
   for (const block of blocks) {
     if (!block || block.type !== 'text' || typeof block.text !== 'string') {
+      const size = Buffer.byteLength(JSON.stringify(block || {}), 'utf8')
+      if (used + size > maxBytes) {
+        out.push({ type: 'text', text: '[truncated]' })
+        break
+      }
       out.push(block)
+      used += size
       continue
     }
     const remain = maxBytes - used

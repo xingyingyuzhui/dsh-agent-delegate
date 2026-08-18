@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -83,6 +83,19 @@ test('apply wraps start / create, registers guard and events, and restores on di
   assert.equal(ctx.agents.create, origCreate)
 })
 
+test('disposing a wrap leaves a later wrapper in place', async () => {
+  const { ctx, disposers } = mockCtx()
+  const origStart = ctx.subagents.start
+  apply(ctx)
+  async function later(provider, request) {
+    return { later: true, provider, request }
+  }
+  ctx.subagents.start = later
+  for (const stop of disposers) if (typeof stop === 'function') stop()
+  assert.equal(ctx.subagents.start, later)
+  assert.notEqual(ctx.subagents.start, origStart)
+})
+
 test('start clamps official tool maxDepth 3 down to policy maxDepth 1 and rejects depth 2', async () => {
   const home = await mkdtemp(join(tmpdir(), 'dsh-delegate-host-'))
   _internal.setDshHome(home)
@@ -142,6 +155,49 @@ test('write child create pins a worktree cwd and persists attenuated policy', as
   assert.ok(record)
   assert.equal(record.policy.files.write, 'workspace')
   assert.equal(record.worktree, creates[0].meta.cwd)
+  assert.ok(record.baseCommit)
+  assert.ok(record.parentRoot)
+})
+
+test('subagent end keeps a child patch and deletes the worktree', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'dsh-delegate-repo-'))
+  execFileSync('git', ['init'], { cwd: repo })
+  execFileSync('git', ['config', 'user.email', 't@t.test'], { cwd: repo })
+  execFileSync('git', ['config', 'user.name', 't'], { cwd: repo })
+  await writeFile(join(repo, 'README'), 'root\n')
+  execFileSync('git', ['add', '.'], { cwd: repo })
+  execFileSync('git', ['commit', '-m', 'init'], { cwd: repo })
+  const home = await mkdtemp(join(tmpdir(), 'dsh-delegate-host-'))
+  _internal.setDshHome(home)
+  const { ctx, events } = mockCtx({
+    agents: {
+      get() {
+        return {
+          session: {
+            id: 'session-parent-eeeeee',
+            header: { cwd: repo, agentPreset: 'developer' },
+            events: [],
+          },
+        }
+      },
+      async create(options) { return { id: options.sessionId } },
+    },
+  })
+  apply(ctx)
+  const childId = 'cccccccc-dddd-eeee-ffff-000000000001'
+  await ctx.agents.create({
+    sessionId: childId,
+    meta: { origin: 'subagent', parentSession: 'session-parent-eeeeee', cwd: repo, delegationDepth: 1 },
+  })
+  const record = loadChildSync(home, childId)
+  await writeFile(join(record.worktree, 'shipped.txt'), 'from-child\n')
+  events['subagent/end']({ id: childId })
+  const patch = await readFile(join(home, 'agent-delegate', 'handoffs', childId + '.patch'), 'utf8')
+  assert.match(patch, /shipped\.txt/)
+  assert.match(patch, /from-child/)
+  await assert.rejects(() => readFile(join(record.worktree, 'shipped.txt'), 'utf8'))
+  await assert.rejects(() => readFile(join(repo, 'shipped.txt'), 'utf8'))
+  assert.equal(loadChildSync(home, childId), null)
 })
 
 test('pre-execute denies a grandchild subagent and a partial file read for research', async () => {
@@ -167,6 +223,55 @@ test('pre-execute denies a grandchild subagent and a partial file read for resea
   const file = pre({ agent: child, name: 'read', arguments: { path: 'README' } }, () => ({ kind: 'allow' }))
   assert.equal(file.kind, 'deny')
   assert.match(file.reason, /partial/)
+})
+
+test('failed agents.create rolls back child record and worktree', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'dsh-delegate-repo-'))
+  execFileSync('git', ['init'], { cwd: repo })
+  execFileSync('git', ['config', 'user.email', 't@t.test'], { cwd: repo })
+  execFileSync('git', ['config', 'user.name', 't'], { cwd: repo })
+  await writeFile(join(repo, 'README'), 'root\n')
+  execFileSync('git', ['add', '.'], { cwd: repo })
+  execFileSync('git', ['commit', '-m', 'init'], { cwd: repo })
+  const home = await mkdtemp(join(tmpdir(), 'dsh-delegate-host-'))
+  _internal.setDshHome(home)
+  const { ctx } = mockCtx({
+    agents: {
+      get() {
+        return {
+          session: {
+            id: 'session-parent-ffffff',
+            header: { cwd: repo, agentPreset: 'developer' },
+            events: [],
+          },
+        }
+      },
+      async create() {
+        throw new Error('provider failed')
+      },
+    },
+  })
+  apply(ctx)
+  const childId = 'ffffffff-1111-2222-3333-444444444444'
+  await assert.rejects(
+    () => ctx.agents.create({
+      sessionId: childId,
+      meta: { origin: 'subagent', parentSession: 'session-parent-ffffff', cwd: repo, delegationDepth: 1 },
+    }),
+    /provider failed/,
+  )
+  assert.equal(loadChildSync(home, childId), null)
+})
+
+test('explicit unknown role is denied before create', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-delegate-host-'))
+  _internal.setDshHome(home)
+  const { ctx, guards } = mockCtx()
+  apply(ctx)
+  const parent = parentAgent(0, 'session-parent-roleee')
+  saveChildSync(home, { sessionId: parent.session.id, policy: applyPreset('developer') })
+  const reason = guards[0]({ agent: parent, name: 'subagent', arguments: { role: 'administrator' } })
+  assert.match(reason, /unknown/)
 })
 
 test('research role child inherits read-only policy and no worktree', async () => {

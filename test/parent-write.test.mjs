@@ -27,7 +27,7 @@ test('write child cannot write the parent workspace; it can write its worktree',
   const child = attenuateChildPolicy(applyPreset('full'), applyPreset('full'))
   assert.equal(child.files.write, 'workspace')
   assert.equal(childNeedsWorktree(child), true)
-  const worktree = createWriteWorktree({ home, sessionId: 'child-acc-1', parentCwd: repo })
+  const worktree = createWriteWorktree({ home, sessionId: 'child-acc-1', parentCwd: repo }).path
   assert.equal(allowExecution(child, 'write', { path: join(repo, 'SECRET.md') }, worktree), false)
   assert.equal(allowExecution(child, 'write', { path: join(worktree, 'out.md') }, worktree), true)
   removeWriteWorktree({ home, sessionId: 'child-acc-1', parentCwd: repo })

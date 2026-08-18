@@ -38,20 +38,35 @@ function textOfPrompt(prompt) {
     .join('\n')
 }
 
-export function parseRequestedRole(args, request) {
+export function parseRoleRequest(args, request) {
   const value = asArgs(args)
   const direct = String(value.role || value.preset || '').toLowerCase().trim()
-  if (isDelegationRole(direct)) return direct
+  if (direct) {
+    return { supplied: true, role: isDelegationRole(direct) ? direct : null, raw: direct }
+  }
   const label = String((request && request.label) || value.description || '')
   const fromLabel = label.match(/^\s*\[(research|developer|reviewer|release|public)\]/i)
-  if (fromLabel) return fromLabel[1].toLowerCase()
+  if (fromLabel) {
+    const role = fromLabel[1].toLowerCase()
+    return { supplied: true, role, raw: role }
+  }
   const prompt = textOfPrompt(request && request.prompt) || String(value.prompt || '')
   const fromPrompt = prompt.match(/^\s*(?:role|preset)\s*[:=]\s*(research|developer|reviewer|release|public)\b/i)
-  if (fromPrompt) return fromPrompt[1].toLowerCase()
-  return null
+  if (fromPrompt) {
+    const role = fromPrompt[1].toLowerCase()
+    return { supplied: true, role, raw: role }
+  }
+  return { supplied: false, role: null, raw: '' }
 }
 
-export function roleDenyReason(policy, requestedRole, storedRoles) {
+export function parseRequestedRole(args, request) {
+  return parseRoleRequest(args, request).role
+}
+
+export function roleDenyReason(policy, requestedRole, storedRoles, supplied) {
+  if (supplied && !requestedRole) {
+    return 'Denied: unknown delegation role.'
+  }
   if (!requestedRole) return undefined
   if (!isDelegationRole(requestedRole) || !isPresetId(requestedRole)) {
     return 'Denied: unknown delegation role ' + requestedRole + '.'

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
@@ -58,6 +59,10 @@ export function normalizeChild(raw, sessionId) {
     parentSession: typeof value.parentSession === 'string' ? value.parentSession : null,
     policy: policyRaw ? normalizePolicy(policyRaw) : null,
     worktree: typeof value.worktree === 'string' && value.worktree ? value.worktree : null,
+    parentRoot: typeof value.parentRoot === 'string' && value.parentRoot ? value.parentRoot : null,
+    parentHead: typeof value.parentHead === 'string' && value.parentHead ? value.parentHead : null,
+    baseCommit: typeof value.baseCommit === 'string' && value.baseCommit ? value.baseCommit : null,
+    handoffPath: typeof value.handoffPath === 'string' && value.handoffPath ? value.handoffPath : null,
     role: typeof value.role === 'string' && value.role ? value.role : null,
     roles: asStringList(value.roles),
     kind: value.kind === 'job' ? 'job' : 'subagent',
@@ -90,7 +95,7 @@ export function saveChildSync(home, record, now = new Date().toISOString()) {
   }
   const file = childFile(home, next.sessionId)
   mkdirSync(dirname(file), { recursive: true })
-  const tmp = file + '.tmp'
+  const tmp = file + '.' + process.pid + '.' + randomUUID() + '.tmp'
   writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n')
   renameSync(tmp, file)
   return next
@@ -117,7 +122,7 @@ export function childrenDir(home) {
   return join(home || defaultDshHome(), 'agent-delegate', 'children')
 }
 
-export function listLiveChildren(home, parentSession) {
+export function listDiskChildren(home) {
   let names
   try {
     names = readdirSync(childrenDir(home))
@@ -129,11 +134,16 @@ export function listLiveChildren(home, parentSession) {
   for (const name of names) {
     if (!name.endsWith('.json')) continue
     const row = loadChildSync(home, name.slice(0, -5))
-    if (!row) continue
-    if (parentSession && row.parentSession !== parentSession) continue
-    out.push(row)
+    if (row) out.push(row)
   }
   return out
+}
+
+export function listLiveChildren(home, parentSession) {
+  return listDiskChildren(home).filter((row) => {
+    if (parentSession && row.parentSession !== parentSession) return false
+    return true
+  })
 }
 
 export function taskFile(home, parentSession) {
@@ -172,10 +182,22 @@ export function bumpTask(home, parentSession, taskKey, sessionId) {
   const prev = ledger.tasks[taskKey]
   const generation = nextGeneration(prev && prev.generation)
   ledger.tasks[taskKey] = { sessionId, generation }
+  writeLedger(home, parentSession, ledger)
+  return { taskKey, sessionId, generation }
+}
+
+function writeLedger(home, parentSession, ledger) {
   const file = taskFile(home, parentSession)
   mkdirSync(dirname(file), { recursive: true })
-  const tmp = file + '.tmp'
+  const tmp = file + '.' + process.pid + '.' + randomUUID() + '.tmp'
   writeFileSync(tmp, JSON.stringify(ledger, null, 2) + '\n')
   renameSync(tmp, file)
-  return { taskKey, sessionId, generation }
+}
+
+export function restoreTask(home, parentSession, taskKey, previous) {
+  if (!safeId(parentSession) || !taskKey) return
+  const ledger = loadTaskLedger(home, parentSession)
+  if (!previous) delete ledger.tasks[taskKey]
+  else ledger.tasks[taskKey] = previous
+  writeLedger(home, parentSession, ledger)
 }

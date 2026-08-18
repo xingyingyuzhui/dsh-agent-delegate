@@ -22,7 +22,7 @@ import { attenuateChildPolicy, childNeedsWorktree, denyPartialFileAction } from 
 import {
   allowedRolesOf,
   childRolesOf,
-  parseRequestedRole,
+  parseRoleRequest,
   roleDenyReason,
   rolePolicyOf,
 } from './delegate-role.mjs'
@@ -32,12 +32,15 @@ import {
   bumpTask,
   defaultDshHome,
   latestTask,
+  listDiskChildren,
   listLiveChildren,
   loadChildSync,
   removeChildSync,
+  restoreTask,
   saveChildSync,
 } from './delegate-store.mjs'
-import { createWriteWorktree, removeWriteWorktree } from './delegate-worktree.mjs'
+import { createWriteWorktree, deliverChildHandoff, formatHandoffNote, removeWriteWorktree } from './delegate-worktree.mjs'
+import { CODES, operation, runWithTrace, setObserveHome } from '../dsh-observability/observe.mjs'
 
 export const name = 'dsh-agent-delegate'
 export const inject = ['tools', 'subagents', 'agents']
@@ -49,6 +52,7 @@ const _internal = {
   setDshHome(dir) {
     dshHome = dir
     cachedProbe = undefined
+    setObserveHome(dir)
   },
   getDshHome() { return dshHome },
   resetProbe() { cachedProbe = undefined },
@@ -58,11 +62,15 @@ export { _internal }
 function wrapMethod(obj, key, wrapper) {
   if (!obj || typeof obj[key] !== 'function') return function () {}
   const orig = obj[key]
-  obj[key] = function wrapped(...args) {
+  let live = true
+  function wrapped(...args) {
+    if (!live) return orig.apply(this, args)
     return wrapper.call(this, orig, ...args)
   }
+  obj[key] = wrapped
   return function () {
-    if (obj[key] !== orig) obj[key] = orig
+    live = false
+    if (obj[key] === wrapped) obj[key] = orig
   }
 }
 
@@ -96,8 +104,9 @@ function wrapJobs(ctx) {
     const owner = spec.owner
     const policy = policyOf(owner)
     const budget = budgetOf(policy, recordOf(owner))
-    if (!reserved) {
-      const reason = budgetDenyReason(liveCount(parentIdOf(owner)), budget.maxChildren)
+    const parentId = parentIdOf(owner)
+    if (!reserved && parentId) {
+      const reason = budgetDenyReason(liveCount(parentId), budget.maxChildren)
       if (reason) {
         const err = new Error(reason)
         err.name = 'SubagentBudgetError'
@@ -207,11 +216,15 @@ function clampRequest(request) {
   if (!request || !request.parent) return request
   const policy = policyOf(request.parent)
   const bag = currentBag()
-  const role = (bag && bag.role) || parseRequestedRole(null, request)
-  const roleReason = roleDenyReason(policy, role, storedRolesOf(request.parent))
+  const spec = parseRoleRequest(null, request)
+  const role = (bag && bag.role) || spec.role
+  const roleReason = roleDenyReason(policy, role, storedRolesOf(request.parent), spec.supplied)
   if (roleReason) {
     const err = new Error(roleReason)
     err.name = 'SubagentRoleError'
+    const logged = operation({ plugin: 'dsh-agent-delegate', feature: 'child-session', operation: 'start_child', sessionId: parentIdOf(request.parent) })
+    logged.start()
+    logged.reject(CODES.DELEGATE_ROLE_DENIED, { reason: 'role_denied' })
     throw err
   }
   const budget = budgetOf(policy, recordOf(request.parent))
@@ -219,6 +232,9 @@ function clampRequest(request) {
   if (budgetReason) {
     const err = new Error(budgetReason)
     err.name = 'SubagentBudgetError'
+    const logged = operation({ plugin: 'dsh-agent-delegate', feature: 'child-session', operation: 'start_child', sessionId: parentIdOf(request.parent) })
+    logged.start()
+    logged.reject(CODES.DELEGATE_BUDGET_DENIED, { reason: 'budget' })
     throw err
   }
   const maxDepth = clampStartMaxDepth(request.maxDepth, policy && policy.delegation && policy.delegation.maxDepth)
@@ -226,6 +242,9 @@ function clampRequest(request) {
   if (reason) {
     const err = new Error(reason)
     err.name = 'SubagentDepthError'
+    const logged = operation({ plugin: 'dsh-agent-delegate', feature: 'child-session', operation: 'start_child', sessionId: parentIdOf(request.parent) })
+    logged.start()
+    logged.reject(CODES.DELEGATE_DEPTH_DENIED, { reason: 'depth' })
     throw err
   }
   return { ...request, maxDepth }
@@ -238,16 +257,31 @@ function prepareChildCreate(ctx, options) {
   const parentLayers = parentLayersOf(ctx, meta.parentSession, meta.cwd)
   const parentPolicy = parentLayers && parentLayers.effective
   const parentRecord = meta.parentSession ? loadChildSync(dshHome, meta.parentSession) : null
-  const role = bag && bag.role ? bag.role : null
-  const roleReason = roleDenyReason(parentPolicy, role, parentRecord && parentRecord.roles)
+  const spec = bag && bag.roleSpec ? bag.roleSpec : parseRoleRequest(null, null)
+  const role = bag && bag.role ? bag.role : spec.role
+  const roleReason = roleDenyReason(parentPolicy, role, parentRecord && parentRecord.roles, spec.supplied)
   if (roleReason) {
+    const denied = operation({ plugin: 'dsh-agent-delegate', feature: 'child-session', operation: 'create_child', sessionId: meta.parentSession, childSessionId: options.sessionId })
+    denied.start()
+    denied.reject(CODES.DELEGATE_ROLE_DENIED, { reason: 'role_denied' })
     const err = new Error(roleReason)
     err.name = 'SubagentRoleError'
     throw err
   }
   const policy = attenuateChildPolicy(parentPolicy, role ? rolePolicyOf(role) : null)
   const roles = childRolesOf(parentPolicy, role, parentRecord && parentRecord.roles)
-  const taskKey = (bag && bag.taskKey) || taskKeyOf(bag && bag.label, role)
+  const taskKey = (bag && bag.taskKey) || taskKeyOf(bag && bag.label, role, options.sessionId)
+  const previousTask = latestTask(dshHome, meta.parentSession, taskKey)
+  const budget = budgetOf(parentPolicy, parentRecord)
+  const budgetReason = budgetDenyReason(liveCount(meta.parentSession), budget.maxChildren)
+  if (budgetReason) {
+    const op = operation({ plugin: 'dsh-agent-delegate', feature: 'child-session', operation: 'create_child', sessionId: meta.parentSession })
+    op.start()
+    op.reject(CODES.DELEGATE_BUDGET_DENIED, { reason: 'budget' })
+    const err = new Error(budgetReason)
+    err.name = 'SubagentBudgetError'
+    throw err
+  }
   const bumped = bumpTask(dshHome, meta.parentSession, taskKey, options.sessionId)
   if (bag) bag.childId = options.sessionId
   const record = {
@@ -272,19 +306,65 @@ function prepareChildCreate(ctx, options) {
     write: policy && policy.files && policy.files.write,
     maxDepth: policy && policy.delegation && policy.delegation.maxDepth,
   })
+  const rollback = () => rollbackChildCreate({
+    sessionId: options.sessionId,
+    parentSession: meta.parentSession,
+    taskKey,
+    previousTask,
+    parentCwd: meta.cwd,
+  })
+  if (bag) bag.rollback = rollback
   if (!childNeedsWorktree(policy)) return options
   try {
-    const path = createWriteWorktree({
+    const created = createWriteWorktree({
       home: dshHome,
       sessionId: options.sessionId,
       parentCwd: meta.cwd,
     })
-    saveChildSync(dshHome, { ...record, worktree: path })
-    appendAudit(dshHome, { kind: 'worktree', sessionId: options.sessionId, worktree: path })
-    return { ...options, meta: { ...meta, cwd: path } }
+    saveChildSync(dshHome, {
+      ...record,
+      worktree: created.path,
+      parentRoot: created.parentRoot,
+      parentHead: created.parentHead,
+      baseCommit: created.baseCommit,
+    })
+    appendAudit(dshHome, { kind: 'worktree', sessionId: options.sessionId, worktree: created.path })
+    return { ...options, meta: { ...meta, cwd: created.path } }
   } catch (error) {
-    removeChildSync(dshHome, options.sessionId)
+    const op = operation({ plugin: 'dsh-agent-delegate', feature: 'child-session', operation: 'create_child', sessionId: meta.parentSession, childSessionId: options.sessionId })
+    op.start()
+    op.stage('worktree')
+    try {
+      rollback()
+      op.fail(CODES.DELEGATE_WORKTREE_FAILED, error, {
+        state: 'clean',
+        recovery: { attempted: true, outcome: 'succeeded' },
+      })
+    } catch (rollbackError) {
+      op.fail(CODES.DELEGATE_ROLLBACK_FAILED, rollbackError, {
+        state: 'orphaned',
+        remainingArtifacts: ['delegate_worktree', 'child_record'],
+        recovery: { attempted: true, outcome: 'failed' },
+      })
+    }
     throw error
+  }
+}
+
+function rollbackChildCreate({ sessionId, parentSession, taskKey, previousTask, parentCwd }) {
+  const record = sessionId ? loadChildSync(dshHome, sessionId) : null
+  if (record && record.worktree) {
+    removeWriteWorktree({
+      home: dshHome,
+      sessionId,
+      parentCwd: parentCwd || record.worktree,
+    })
+  }
+  if (sessionId) removeChildSync(dshHome, sessionId)
+  if (parentSession && taskKey) {
+    restoreTask(dshHome, parentSession, taskKey, previousTask
+      ? { sessionId: previousTask.sessionId, generation: previousTask.generation }
+      : null)
   }
 }
 
@@ -297,8 +377,8 @@ function denyExec(ctx, exec) {
   const name = exec.name
   const args = exec.arguments
   if (isSubagentTool(name)) {
-    const role = parseRequestedRole(args, null)
-    const roleReason = roleDenyReason(policy, role, storedRolesOf(agent))
+    const spec = parseRoleRequest(args, null)
+    const roleReason = roleDenyReason(policy, spec.role, storedRolesOf(agent), spec.supplied)
     if (roleReason) return roleReason
     const budget = budgetOf(policy, recordOf(agent))
     const budgetReason = budgetDenyReason(liveCount(session.id), budget.maxChildren)
@@ -312,27 +392,79 @@ function denyExec(ctx, exec) {
     if (budgetReason) return budgetReason
   }
   const cwd = headerOf(session).cwd
-  const partial = denyPartialFileAction(policy, enforcementOf(ctx, cwd), name, args)
+  const childRecord = loadChildSync(dshHome, session.id)
+  const partial = denyPartialFileAction(policy, enforcementOf(ctx, cwd), name, args, childRecord && childRecord.role)
   if (partial) return partial
-  const record = loadChildSync(dshHome, session.id)
+  const record = childRecord
   if (record && record.policy && !allowExecution(policy, name, args, cwd)) {
     return renderDenyReceipt(classifyTool(name, args), 'Denied by delegated child policy.')
   }
   return undefined
 }
 
+function captureHandoff(record) {
+  if (!record || !record.worktree) return null
+  try {
+    const info = deliverChildHandoff({
+      home: dshHome,
+      sessionId: record.sessionId,
+      worktree: record.worktree,
+      baseCommit: record.baseCommit,
+      parentRoot: record.parentRoot,
+    })
+    if (info && info.path) {
+      saveChildSync(dshHome, { ...record, handoffPath: info.path })
+    }
+    return info
+  } catch {
+    return null
+  }
+}
+
+function attachHandoffNote(result, info) {
+  const note = formatHandoffNote(info)
+  if (!note) return result
+  if (!result || typeof result !== 'object') return result
+  if (result.kind === 'block' || result.kind === 'deny') return result
+  const value = result.value
+  if (value && typeof value === 'object' && Array.isArray(value.output)) {
+    return {
+      kind: 'accept',
+      value: { ...value, output: [{ type: 'text', text: note }, ...value.output] },
+    }
+  }
+  if (typeof result.content === 'string') {
+    return { ...result, content: note + '\n\n' + result.content }
+  }
+  return result
+}
+
 function cleanupChild(sessionId) {
   const record = loadChildSync(dshHome, sessionId)
   if (!record) return
+  const handoff = captureHandoff(record)
+  if (handoff && !handoff.empty) {
+    const op = operation({ plugin: 'dsh-agent-delegate', feature: 'handoff', operation: 'child_handoff', sessionId: record.parentSession, childSessionId: sessionId })
+    op.start()
+    op.success({ code: CODES.DELEGATE_HANDOFF_SAVED, fileCount: (handoff.files || []).length, bytes: handoff.bytes })
+  }
   if (record.worktree) {
     removeWriteWorktree({
       home: dshHome,
       sessionId,
-      parentCwd: record.worktree,
+      parentCwd: record.parentRoot || record.worktree,
     })
   }
   removeChildSync(dshHome, sessionId)
-  appendAudit(dshHome, { kind: 'end', sessionId, worktree: record.worktree, role: record.role, taskKey: record.taskKey })
+  appendAudit(dshHome, {
+    kind: 'end',
+    sessionId,
+    worktree: record.worktree,
+    role: record.role,
+    taskKey: record.taskKey,
+    handoffPath: handoff && handoff.path,
+    handoffFiles: handoff && handoff.files,
+  })
 }
 
 function prepareJobWorktree(exec) {
@@ -342,10 +474,10 @@ function prepareJobWorktree(exec) {
   const parentSession = parentIdOf(agent)
   const jobId = 'job-' + randomUUID()
   const role = null
-  const taskKey = taskKeyOf(labelOf(exec.arguments), role)
+  const taskKey = taskKeyOf(labelOf(exec.arguments), role, jobId)
   const bumped = bumpTask(dshHome, parentSession, taskKey, jobId)
   const cwd = headerOf(agent && agent.session).cwd
-  const path = createWriteWorktree({
+  const created = createWriteWorktree({
     home: dshHome,
     sessionId: jobId,
     parentCwd: cwd,
@@ -354,25 +486,29 @@ function prepareJobWorktree(exec) {
     sessionId: jobId,
     parentSession,
     policy,
-    worktree: path,
+    worktree: created.path,
+    parentRoot: created.parentRoot,
+    parentHead: created.parentHead,
+    baseCommit: created.baseCommit,
     role,
     roles: allowedRolesOf(policy, storedRolesOf(agent)),
     kind: 'job',
     taskKey,
     generation: bumped.generation,
   })
-  appendAudit(dshHome, { kind: 'worktree', sessionId: jobId, parentSession, worktree: path, job: true })
-  return { jobId, path }
+  appendAudit(dshHome, { kind: 'worktree', sessionId: jobId, parentSession, worktree: created.path, job: true })
+  return { jobId, path: created.path }
 }
 
 function bagFromExec(exec) {
   if (!exec) return null
   if (isSubagentTool(exec.name)) {
-    const role = parseRequestedRole(exec.arguments, null)
+    const spec = parseRoleRequest(exec.arguments, null)
     return {
-      role,
+      role: spec.role,
+      roleSpec: spec,
       label: labelOf(exec.arguments),
-      taskKey: taskKeyOf(labelOf(exec.arguments), role),
+      taskKey: taskKeyOf(labelOf(exec.arguments), spec.role, parentIdOf(exec.agent)),
       parentSession: parentIdOf(exec.agent),
     }
   }
@@ -385,24 +521,75 @@ function applyHandoffResult(result, childId, maxBytes) {
   if (!record) return result
   const latest = latestTask(dshHome, record.parentSession, record.taskKey)
   if (isStaleRecord(record, latest)) {
+    const stale = operation({ plugin: 'dsh-agent-delegate', feature: 'handoff', operation: 'child_handoff', sessionId: record.parentSession, childSessionId: childId })
+    stale.start()
+    stale.reject(CODES.DELEGATE_STALE_RESULT, { reason: 'stale_generation' })
     return { kind: 'block', feedback: [{ type: 'text', text: staleDenyReason() }] }
   }
   if (!result || typeof result !== 'object') return result
   if (result.kind === 'block' || result.kind === 'deny') return result
+  const handoff = captureHandoff(record)
   const value = result.value
+  let next = result
   if (value && typeof value === 'object' && Array.isArray(value.output)) {
-    return {
+    next = {
       kind: 'accept',
       value: { ...value, output: trimContentBlocks(value.output, maxBytes) },
     }
+  } else if (typeof result.content === 'string') {
+    next = { ...result, content: trimHandoff(result.content, maxBytes).text }
   }
-  if (typeof result.content === 'string') {
-    return { ...result, content: trimHandoff(result.content, maxBytes).text }
+  return attachHandoffNote(next, handoff)
+}
+
+function liveIdsOf(ctx) {
+  const sessionIds = []
+  const jobIds = []
+  try {
+    const agents = optionalService(ctx, 'agents')
+    const list = agents && typeof agents.list === 'function' ? agents.list() : []
+    for (const agent of list || []) {
+      const id = agent && agent.session && agent.session.id
+      if (id) sessionIds.push(id)
+    }
+  } catch { /* optional */ }
+  try {
+    const jobs = optionalService(ctx, 'jobs')
+    const list = jobs && typeof jobs.list === 'function' ? jobs.list() : []
+    for (const job of list || []) {
+      if (job && job.id && (job.status === 'running' || job.status === 'stopping')) jobIds.push(job.id)
+    }
+  } catch { /* optional */ }
+  return { sessionIds, jobIds }
+}
+
+function reconcileOrphans(ctx) {
+  const agents = optionalService(ctx, 'agents')
+  const jobs = optionalService(ctx, 'jobs')
+  if ((!agents || typeof agents.list !== 'function') && (!jobs || typeof jobs.list !== 'function')) return
+  const live = liveIdsOf(ctx)
+  const sessions = new Set(live.sessionIds)
+  const liveJobs = new Set(live.jobIds)
+  for (const row of listDiskChildren(dshHome)) {
+    if (sessions.has(row.sessionId)) continue
+    if (row.jobId && liveJobs.has(row.jobId)) continue
+    if (row.worktree) {
+      removeWriteWorktree({
+        home: dshHome,
+        sessionId: row.sessionId,
+        parentCwd: row.worktree,
+      })
+    }
+    removeChildSync(dshHome, row.sessionId)
+    appendAudit(dshHome, { kind: 'reconcile', sessionId: row.sessionId, worktree: row.worktree })
+    const op = operation({ plugin: 'dsh-agent-delegate', feature: 'child-session', operation: 'reconcile', sessionId: row.parentSession, childSessionId: row.sessionId })
+    op.start()
+    op.degraded(CODES.DELEGATE_ORPHAN_RECONCILED, { state: 'clean', remainingArtifacts: [] })
   }
-  return result
 }
 
 export function apply(ctx) {
+  try { reconcileOrphans(ctx) } catch { /* startup reconcile is best-effort */ }
   const stopStart = wrapMethod(ctx.subagents, 'start', function (orig, provider, request) {
     return Promise.resolve().then(() => orig.call(this, provider, clampRequest(request)))
   })
@@ -413,7 +600,51 @@ export function apply(ctx) {
     })
   })
   const stopCreate = wrapMethod(ctx.agents, 'create', function (orig, options) {
-    return Promise.resolve().then(() => orig.call(this, prepareChildCreate(ctx, options)))
+    return Promise.resolve().then(() => runWithTrace(options && options.traceId, () => {
+      let prepared
+      try {
+        prepared = prepareChildCreate(ctx, options)
+      } catch (error) {
+        throw error
+      }
+      if (!options || !options.meta || options.meta.origin !== 'subagent') {
+        return orig.call(this, prepared)
+      }
+      const op = operation({
+        plugin: 'dsh-agent-delegate',
+        feature: 'child-session',
+        operation: 'create_child',
+        sessionId: options.meta.parentSession,
+        childSessionId: options.sessionId,
+      })
+      op.start()
+      op.stage('provider_create')
+      return Promise.resolve(orig.call(this, prepared)).then((value) => {
+        op.success({ childSessionId: options.sessionId })
+        return value
+      }).catch((error) => {
+        let recovered = true
+        try {
+          const bag = currentBag()
+          if (bag && typeof bag.rollback === 'function') bag.rollback()
+          else if (prepared && prepared.sessionId) {
+            rollbackChildCreate({
+              sessionId: prepared.sessionId,
+              parentSession: prepared.meta && prepared.meta.parentSession,
+              parentCwd: prepared.meta && prepared.meta.cwd,
+            })
+          }
+        } catch {
+          recovered = false
+        }
+        op.fail(CODES.DELEGATE_PROVIDER_CREATE_FAILED, error, {
+          state: recovered ? 'clean' : 'orphaned',
+          remainingArtifacts: recovered ? [] : ['delegate_worktree', 'child_record'],
+          recovery: { attempted: true, outcome: recovered ? 'succeeded' : 'failed' },
+        })
+        throw error
+      })
+    }))
   })
   const optionalStops = []
   if (typeof ctx.inject === 'function') {
@@ -476,6 +707,10 @@ export function apply(ctx) {
       }
       if (!bag.role && !bag.jobWorktree && !isSubagentTool(exec && exec.name)) return next()
       return runWithBag(bag, () => Promise.resolve().then(() => next()).then((result) => {
+        if (bag.jobId) {
+          const jobRecord = loadChildSync(dshHome, bag.jobId)
+          return attachHandoffNote(result, captureHandoff(jobRecord))
+        }
         if (!isSubagentTool(exec && exec.name)) return result
         const policy = policyOf(exec.agent)
         return applyHandoffResult(result, bag.childId, budgetOf(policy, recordOf(exec.agent)).maxOutputBytes)

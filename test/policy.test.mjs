@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { applyPreset, intersectPolicies } from '../../dsh-session-permissions/perm-schema.mjs'
+import { rolePolicyOf } from '../delegate-role.mjs'
 import {
   attenuateChildPolicy,
   childNeedsWorktree,
@@ -28,6 +29,18 @@ test('write-all child is attenuated to workspace so it cannot write the parent r
   assert.equal(child.files.write, 'workspace')
   assert.equal(childNeedsWorktree(child), true)
   assert.equal(childNeedsWorktree(applyPreset('research')), false)
+})
+
+test('intersected research child still requires full enforcement via role', () => {
+  const child = attenuateChildPolicy(applyPreset('developer'), rolePolicyOf('research'))
+  assert.equal(child.preset, 'developer')
+  assert.equal(child.files.write, 'none')
+  assert.equal(requiresFullEnforcement(child), false)
+  assert.equal(requiresFullEnforcement(child, 'research'), true)
+  assert.match(
+    denyPartialFileAction(child, { kind: 'ok', enforcement: 'partial' }, 'read', {}, 'research'),
+    /partial/,
+  )
 })
 
 test('research / reviewer / public require full sandbox enforcement', () => {
