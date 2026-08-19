@@ -70,21 +70,53 @@ function parentAgent(depth = 0, id = 'session-parent-aaaaaa', policyPreset = 'de
 
 test('delegate_handoff parameters are a JSON Schema object', () => {
   let registered
-  const { ctx } = mockCtx({
+  const { ctx, events } = mockCtx({
     tools: {
-      register(def) {
-        registered = def
-        return () => {}
-      },
+      register() { throw new Error('host tools must not take handoff') },
       guard() { return () => {} },
     },
   })
   apply(ctx)
+  events['agent/session-start']({
+    agent: {
+      session: { header: { cwd: join(tmpdir(), 'DSclaw', 'bot1') } },
+      ctx: {
+        tools: {
+          register(def) {
+            registered = def
+            return () => {}
+          },
+        },
+      },
+    },
+  })
   assert.equal(registered.name, 'delegate_handoff')
   assert.equal(registered.parameters.type, 'object')
   assert.ok(registered.parameters.properties.action)
   assert.ok(registered.parameters.properties.child)
   assert.deepEqual(registered.parameters.required, ['action'])
+})
+
+test('workspace sessions do not get delegate_handoff', () => {
+  let registered = false
+  const { ctx, events } = mockCtx({
+    tools: {
+      register() { registered = true; return () => {} },
+      guard() { return () => {} },
+    },
+  })
+  apply(ctx)
+  events['agent/session-start']({
+    agent: {
+      session: { header: { cwd: join(tmpdir(), 'Desktop', 'project') } },
+      ctx: {
+        tools: {
+          register() { registered = true; return () => {} },
+        },
+      },
+    },
+  })
+  assert.equal(registered, false)
 })
 
 test('apply wraps start / create, registers guard and events, and restores on dispose', () => {

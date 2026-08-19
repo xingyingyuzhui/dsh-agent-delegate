@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { resolveLayersSync } from '../dsh-session-permissions/perm-layers.mjs'
 import { renderDenyReceipt } from '../dsh-session-permissions/perm-official.mjs'
 import { asArgs, classifyTool } from '../dsh-session-permissions/perm-schema.mjs'
-import { allowExecution } from '../dsh-session-permissions/perm-path.mjs'
+import { allowExecution, looksLikeDsClaw } from '../dsh-session-permissions/perm-path.mjs'
 import { currentBag, runWithBag } from './delegate-context.mjs'
 import {
   clampStartMaxDepth,
@@ -615,6 +615,9 @@ function handoffTool() {
 }
 
 function mountHandoffTool(agent) {
+  const session = agent && agent.session
+  const cwd = session && session.header && session.header.cwd ? String(session.header.cwd) : ''
+  if (!looksLikeDsClaw(cwd)) return
   const tools = agent && agent.ctx && agent.ctx.tools
   if (!tools || typeof tools.register !== 'function') return
   try { tools.register(handoffTool()) } catch { /* already registered */ }
@@ -813,10 +816,6 @@ export function apply(ctx) {
       mountHandoffTool(payload && payload.agent)
     })
     : function () {}
-
-  if (ctx.tools && typeof ctx.tools.register === 'function') {
-    try { ctx.tools.register(handoffTool()) } catch { /* already registered */ }
-  }
 
   const optionalWeb = optionalService(ctx, 'webServer')
   const stopRoutes = []
