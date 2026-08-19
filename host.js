@@ -594,8 +594,12 @@ function handoffTool() {
     description: 'Accept, reject, or list write-child handoff patches. Accept applies the saved patch to the parent git workspace after you have reviewed the child. Reject discards it. Do not accept blindly.',
     timeoutMs: 20000,
     parameters: {
-      action: { type: 'string', required: true, description: 'list | accept | reject' },
-      child: { type: 'string', description: 'Child session id for accept/reject' },
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'accept', 'reject'], description: 'list | accept | reject' },
+        child: { type: 'string', description: 'Child session id for accept/reject' },
+      },
+      required: ['action'],
     },
     output: {
       schema: { type: 'object' },

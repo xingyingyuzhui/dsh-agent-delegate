@@ -68,6 +68,25 @@ function parentAgent(depth = 0, id = 'session-parent-aaaaaa', policyPreset = 'de
   }
 }
 
+test('delegate_handoff parameters are a JSON Schema object', () => {
+  let registered
+  const { ctx } = mockCtx({
+    tools: {
+      register(def) {
+        registered = def
+        return () => {}
+      },
+      guard() { return () => {} },
+    },
+  })
+  apply(ctx)
+  assert.equal(registered.name, 'delegate_handoff')
+  assert.equal(registered.parameters.type, 'object')
+  assert.ok(registered.parameters.properties.action)
+  assert.ok(registered.parameters.properties.child)
+  assert.deepEqual(registered.parameters.required, ['action'])
+})
+
 test('apply wraps start / create, registers guard and events, and restores on dispose', () => {
   const { ctx, guards, events, disposers } = mockCtx()
   const origStart = ctx.subagents.start
